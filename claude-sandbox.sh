@@ -42,6 +42,23 @@
 #   5. Your host ~/.claude and ~/.claude.json are mounted read-write into the
 #      container (shared login, sessions, history — BOTH ways).
 #
+# Hiding parts of the project (.claudesandboxignore):
+#   An optional file next to .claude-sandbox/. Each line is a glob pattern
+#   ('*' = any characters within ONE path segment; '#' comments and blank
+#   lines are ignored); every project entry it matches — file or folder, at
+#   any depth — stays untouched on the host but is EMPTY inside the container
+#   (an empty tmpfs is mounted over it). Patterns without '/' match top-level
+#   entries only; with '/' — a path from the project root, e.g.:
+#
+#     node_modules        ← an exact top-level name
+#     .env                ← a file works the same way (visible, empty)
+#     *secret*            ← any top-level name containing "secret"
+#     src/generated       ← a nested path...
+#     */build             ← ...at any top level (front/build, back/build)
+#
+#   No file, or no matches → the run is exactly as before. .claude-sandbox/
+#   and .git are never touched or scanned.
+#
 # Security notes (accepted trade-offs):
 #   - Container is non-root, no sudo, no caps, no-new-privileges, limited
 #     pids/cpus/memory, tmpfs on /tmp and /run, fixed public DNS.
@@ -179,6 +196,77 @@ case "$(uname -s)" in
     hostpath() { printf '%s' "$1"; } ;;
 esac
 
+# read_ignore_patterns file — reads a .claudesandboxignore file and prints its
+# patterns one per line: leading/trailing whitespace is trimmed, blank lines and
+# whole-line # comments are skipped. A missing file is not an error — the
+# output is just empty (no ignore rules → plain launch).
+read_ignore_patterns() { # read_ignore_patterns file → stdout: patterns
+  local file="${1:-}"
+  [ -f "$file" ] || return 0
+  local line
+  while read -r line; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    printf '%s\n' "$line"
+  done < "$file"
+}
+
+# glob_ere pattern — converts a glob pattern to an ERE body: '*' becomes
+# [^/]* (any characters within ONE path segment — so a pattern never sneaks
+# past a '/'), every other character is literal (regex specials are escaped).
+# A single 'sed' pass: escape the specials first, then turn the escaped '*'s.
+glob_ere() { # glob_ere pattern → stdout: ERE body
+  printf '%s' "$1" | sed -e 's,[][\.*+(){}?^$|\\],\\&,g' -e 's,\\\*,[^/]*,g'
+}
+
+# ignore_match pattern relpath — true (exit 0) when glob pattern matches the
+# path relative to the project root. Anchored on both ends: 'node_modules'
+# matches only an entry named exactly that; a pattern without '/' therefore
+# can only reach top-level entries, one with '/' — an entire relative path.
+ignore_match() { # ignore_match pattern relpath → exit 0 iff match
+  local ere
+  ere="$(glob_ere "$1")"
+  [[ "$2" =~ ^${ere}$ ]]
+}
+
+# ignore_scan project_dir — walks the project tree and prints the paths that
+# match the project's .claudesandboxignore patterns, relative to project_dir,
+# one per line (line-based: a filename containing a newline is not supported).
+# The walk stops at the depth of the deepest pattern; .claude-sandbox and
+# .git are never traversed or matched — the agent's own state and the repo
+# metadata are out of scope. No ignore file → no output, exit 0.
+ignore_scan() { # ignore_scan project_dir → stdout: matched rel paths
+  local root="${1:-}"
+  local file="$root/.claudesandboxignore"
+  [ -f "$file" ] || return 0
+
+  # Patterns and their precompiled EREs live in parallel arrays; the walk's
+  # -maxdepth is the pattern with the most '/'-separated segments.
+  local -a patterns=() eres=()
+  local p nsegs maxdepth=1
+  while IFS= read -r p; do # read_ignore_patterns has cleaned: no blanks/comments
+    slashes="${p//[!\/]/}" # keep only the '/'s, count them
+    nsegs=$(( ${#slashes} + 1 ))
+    [ "$nsegs" -gt "$maxdepth" ] && maxdepth="$nsegs"
+    patterns+=("$p")
+    eres+=("$(glob_ere "$p")")
+  done < <(read_ignore_patterns "$file")
+  [ "${#patterns[@]}" -gt 0 ] || return 0
+
+  local d rel i
+  while IFS= read -r -d '' d; do
+    rel="${d#"$root"/}"
+    for i in "${!patterns[@]}"; do
+      if [[ "$rel" =~ ^${eres[i]}$ ]]; then
+        printf '%s\n' "$rel"
+        break # first matching pattern wins; further ones only duplicate the shadow
+      fi
+    done
+  done < <(find "$root" -mindepth 1 -maxdepth "$maxdepth" \
+             \( -name .claude-sandbox -o -name .git \) -prune -o -print0)
+}
+
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
@@ -241,8 +329,18 @@ mem_limit() { # mem_limit → stdout: ${N}m
 # No exec: docker run -it replaces the terminal session itself; the exit code
 # arrives through the plain command.
 run_container() {
-  local project
-  project=$(hostpath "$(pwd -P)")
+  local project root
+  root=$(pwd -P)
+  project=$(hostpath "$root")
+  # Empty tmpfs mounts over every entry matched by .claudesandboxignore: the
+  # host content stays untouched, inside the container the entry is visible
+  # but empty. Container-only paths — no hostpath() conversion. The
+  # ${shadows[@]+...} guard is for the empty-array expansion on bash 3.2.
+  local -a shadows=()
+  local p
+  while IFS= read -r p; do
+    shadows+=(--tmpfs "/work/$p")
+  done < <(ignore_scan "$root")
   docker run -it --rm \
     --cap-drop=ALL --security-opt=no-new-privileges \
     --pids-limit=512 --cpus=4.0 --memory "$(mem_limit)" \
@@ -255,6 +353,7 @@ run_container() {
     -v "$project/.claude-sandbox/home:/home/$USERNAME" \
     -v "$(hostpath "$HOME")/.claude:/home/$USERNAME/.claude" \
     -v "$(hostpath "$HOME")/.claude.json:/home/$USERNAME/.claude.json" \
+    ${shadows[@]+"${shadows[@]}"} \
     "$(image_tag "$(pwd -P)")" \
     claude --dangerously-skip-permissions "$@"
 }
