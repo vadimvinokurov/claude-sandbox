@@ -17,22 +17,15 @@
 #   2. Make it callable as `claude-sandbox` from any directory: from the
 #      folder where the script lies, run (the shell resolves $PWD itself):
 #
-#      macOS / Linux / WSL2 — same everywhere:
+#      macOS / Linux:
 #        chmod +x "$PWD/claude-sandbox.sh" && \
 #          sudo ln -sf "$PWD/claude-sandbox.sh" /usr/local/bin/claude-sandbox
 #      No sudo rights? Use a user dir on PATH (~/.local/bin usually is):
 #          ln -sf "$PWD/claude-sandbox.sh" ~/.local/bin/claude-sandbox
 #
-#      Windows — the script is bash, so run it from WSL2 (recommended):
-#        use the Linux symlink above (Windows-side Docker Desktop integrates
-#        with WSL2 automatically). In Git Bash, `ln -s` silently copies —
-#        fine too: copy the script and keep both in sync, or just put its
-#        directory on PATH and call `claude-sandbox.sh`.
-#      To call from cmd/PowerShell, add a shim claude-sandbox.cmd next to the
-#      script (%~dp0 resolves to the shim's own folder at run time):
-#        @echo off
-#        "C:\Program Files\Git\bin\bash.exe" "%~dp0claude-sandbox.sh" %*
-#
+#      Windows (it lands on the user PATH automatically):
+#        [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";" + "$($PWD.Path)", "User")
+
 #      Then run it from a project folder:     claude-sandbox
 #      Any extra args are passed to claude, e.g.:   claude-sandbox --resume
 #   3. First run: the image builds once (~1-2 min); after that rebuilds are
@@ -171,6 +164,21 @@ info() { # info msg — stdout
   printf '%s\n' "$*"
 }
 
+# Git Bash (MSYS): its automatic path rewriting turns container paths into
+# Windows ones (/work, /tmp, /entrypoint.sh become "C:\Program Files\Git\..."),
+# which breaks -v, --tmpfs and --entrypoint — hence "invalid mount path: 'C'".
+# So rewriting is disabled and host paths are pre-translated here into the
+# drive-letter form cygpath gives ("C:/..."), which docker on Windows accepts;
+# container-only paths (/:/work, /tmp, /home/...) pass through untouched.
+# On Linux / WSL2 cygpath may not exist and rewriting doesn't happen anyway.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    export MSYS_NO_PATHCONV=1
+    hostpath() { cygpath -m "$1"; } ;;
+  *)
+    hostpath() { printf '%s' "$1"; } ;;
+esac
+
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
@@ -233,6 +241,8 @@ mem_limit() { # mem_limit → stdout: ${N}m
 # No exec: docker run -it replaces the terminal session itself; the exit code
 # arrives through the plain command.
 run_container() {
+  local project
+  project=$(hostpath "$(pwd -P)")
   docker run -it --rm \
     --cap-drop=ALL --security-opt=no-new-privileges \
     --pids-limit=512 --cpus=4.0 --memory "$(mem_limit)" \
@@ -241,10 +251,10 @@ run_container() {
     --add-host=host.docker.internal:host-gateway \
     -e TERM="${TERM:-xterm-256color}" \
     --entrypoint /entrypoint.sh \
-    -v "$(pwd -P):/work" \
-    -v "$(pwd -P)/.claude-sandbox/home:/home/$USERNAME" \
-    -v "$HOME/.claude:/home/$USERNAME/.claude" \
-    -v "$HOME/.claude.json:/home/$USERNAME/.claude.json" \
+    -v "$project:/work" \
+    -v "$project/.claude-sandbox/home:/home/$USERNAME" \
+    -v "$(hostpath "$HOME")/.claude:/home/$USERNAME/.claude" \
+    -v "$(hostpath "$HOME")/.claude.json:/home/$USERNAME/.claude.json" \
     "$(image_tag "$(pwd -P)")" \
     claude --dangerously-skip-permissions "$@"
 }
