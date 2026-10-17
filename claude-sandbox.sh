@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# claude-sandbox.sh — Docker sandbox launcher for Claude Code.
+#
+# Runs Claude Code with --dangerously-skip-permissions inside an isolated,
+# disposable container. Run it from ANY project directory; everything lives
+# in that directory's .claude-sandbox/.
+#
+# Subcommands (the first argument; anything else is passed to claude):
+#   claude-sandbox.sh           — start Claude Code in the sandbox (default)
+#   claude-sandbox.sh clear     — full reset: remove this project's .claude-sandbox/
+#                                 dir and its image (caches/toolchains re-download)
+#   claude-sandbox.sh rebuild   — rebuild this project's image from scratch
+#                                 (--no-cache: apt, node, claude, uv all re-run)
+#
+# Quick start:
+#   1. Install Docker
+#   2. Make it callable as `claude-sandbox` from any directory: from the
+#      folder where the script lies, run (the shell resolves $PWD itself):
+#
+#      macOS / Linux / WSL2 — same everywhere:
+#        chmod +x "$PWD/claude-sandbox.sh" && \
+#          sudo ln -sf "$PWD/claude-sandbox.sh" /usr/local/bin/claude-sandbox
+#      No sudo rights? Use a user dir on PATH (~/.local/bin usually is):
+#          ln -sf "$PWD/claude-sandbox.sh" ~/.local/bin/claude-sandbox
+#
+#      Windows — the script is bash, so run it from WSL2 (recommended):
+#        use the Linux symlink above (Windows-side Docker Desktop integrates
+#        with WSL2 automatically). In Git Bash, `ln -s` silently copies —
+#        fine too: copy the script and keep both in sync, or just put its
+#        directory on PATH and call `claude-sandbox.sh`.
+#      To call from cmd/PowerShell, add a shim claude-sandbox.cmd next to the
+#      script (%~dp0 resolves to the shim's own folder at run time):
+#        @echo off
+#        "C:\Program Files\Git\bin\bash.exe" "%~dp0claude-sandbox.sh" %*
+#
+#      Then run it from a project folder:     claude-sandbox
+#      Any extra args are passed to claude, e.g.:   claude-sandbox --resume
+#   3. First run: the image builds once (~1-2 min); after that rebuilds are
+#      instant (Docker layer cache). Log in inside the container: /login
+#      (macOS Keychain login from the host is not visible to the container).
+#   4. Closing Claude or the terminal removes the container (--rm). Project
+#      state lives in ./.claude-sandbox/:
+#        .claude-sandbox/home/     — agent home dir (caches, toolchains).
+#                                    Wipe it for a factory reset.
+#        .claude-sandbox/builder/  — Dockerfile + entrypoint.sh, seeded once;
+#                                    edit the Dockerfile per project and it
+#                                    will NOT be overwritten (delete it to
+#                                    re-seed the default).
+#   5. Your host ~/.claude and ~/.claude.json are mounted read-write into the
+#      container (shared login, sessions, history — BOTH ways).
+#
+# Security notes (accepted trade-offs):
+#   - Container is non-root, no sudo, no caps, no-new-privileges, limited
+#     pids/cpus/memory, tmpfs on /tmp and /run, fixed public DNS.
+#   - The container has FULL network access (internet + LAN + host ports).
+#   - The mounted ~/.claude is writable: an in-container agent could poison
+#     host hooks in ~/.claude settings. This is a conscious decision.
+#   - Anything Claude deletes in /work is deleted on the host — keep /work
+#     under version control.
+#
+# Structure: constants → helpers → stages → main (at the end; add new stages
+# before main).
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2034  # used by later stages
+BUILDER_DIR=".claude-sandbox/builder"
+# shellcheck disable=SC2034
+STATE_DIR=".claude-sandbox/home"
+
+# Files materialized into the per-project dir (image Dockerfile + entrypoint.
+# Both are seeded into builder/ — the build's build-context, where COPY picks
+# up the entrypoint from).
+# shellcheck disable=SC2016  # deliberately leave $ unexpanded in heredoc vars
+read -r -d '' DOCKERFILE_MAIN <<'EOF_PLACEHOLDER' || true
+# Dockerfile — claude-sandbox image (layers; edit per project as you like).
+FROM ubuntu:26.04
+
+# apt must not ask interactive questions — nobody inside the build answers them.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Minimal package set in one layer, with the apt cache cleaned afterwards.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates git zsh less build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# User with host UID/GID (build-args) — files in /work don't change owner.
+# The host GID may be held by any system group (macOS: GID 20 = staff, while
+# in ubuntu GID 20 = dialout), so drop whoever owns the target GID, not just ubuntu.
+ARG UID=1000
+ARG GID=1000
+ARG USERNAME=proj
+RUN userdel -r ubuntu || true && \
+    groupdel ubuntu || true && \
+    existing="$(getent group ${GID} | cut -d: -f1)" && \
+    if [ -n "$existing" ] && [ "$existing" != "${USERNAME}" ]; then \
+      groupdel "$existing"; \
+    fi && \
+    groupadd -g ${GID} ${USERNAME} && \
+    useradd -m -u ${UID} -g ${GID} -s /bin/bash ${USERNAME}
+
+# Node LTS (deb.nodesource.com) with cache cleanup.
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Claude Code and uv as system binaries (root, outside the mount-shadowed home).
+# At runtime /home/<user> is shadowed by the per-project state mount, so any
+# binary baked into ~/.local is invisible in the container: install to /usr/local/bin.
+# claude.ai/install.sh installs per-user into ~/.local/bin — hence the npm package;
+# the npm cache is cleaned in the same layer.
+RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
+
+# uv — the agent's Python environment manager; UV_INSTALL_DIR moves it to /usr/local/bin.
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh -
+
+USER ${USERNAME}
+# ~/.local/bin still on PATH — for user-space tools the agent installs into
+# the state dir at container runtime.
+ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
+
+# Entrypoint is copied executable: the seed file in builder/ is mode 644,
+# COPY preserves the source mode, hence --chmod=555 (BuildKit).
+COPY --chmod=555 entrypoint.sh /entrypoint.sh
+
+# No CMD — the launcher always passes the command.
+WORKDIR /work
+EOF_PLACEHOLDER
+
+# shellcheck disable=SC2016  # deliberately leave $ unexpanded in heredoc vars
+read -r -d '' ENTRYPOINT_SH <<'EOF_PLACEHOLDER' || true
+#!/bin/sh
+# entrypoint.sh — initialize the state dir ($HOME), then exec the command.
+# The $HOME mount shadows what's baked into the image: files are seeded only
+# if missing.
+set -eu
+umask 022
+export PATH="$HOME/.local/bin:$PATH"
+
+# ~/.zshrc: PATH with ~/.local/bin (claude and uv live there) + umask 022
+# (644 files / 755 dirs — otherwise /work files become foreign to the host).
+[ -f "$HOME/.zshrc" ] || cat > "$HOME/.zshrc" <<'INNER'
+export PATH="$HOME/.local/bin:$PATH"
+umask 022
+INNER
+
+# ~/.gitconfig: without an identity git rejects the first commit.
+[ -f "$HOME/.gitconfig" ] || {
+  git config --global user.name "Claude Agent"
+  git config --global user.email "agent@claude.ai"
+}
+
+exec "$@"
+EOF_PLACEHOLDER
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() { # die msg — stderr + exit 1
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+info() { # info msg — stdout
+  printf '%s\n' "$*"
+}
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    die 'Docker is not installed or the daemon is not running — install Docker (OrbStack/Docker Desktop on macOS, docker-ce/Docker Desktop on Linux and in WSL2)'
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    die 'Docker is not installed or the daemon is not running — install Docker (OrbStack/Docker Desktop on macOS, docker-ce/Docker Desktop on Linux and in WSL2)'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+# image_tag cwd — deterministic image tag for a project directory:
+# claude-sandbox:proj-<crc32>. cksum is stable on one host, the tag characters
+# are safe for docker (lowercase name + digits), the tag is unique per directory.
+image_tag() { # image_tag cwd → stdout: claude-sandbox:proj-<crc>
+  local cwd="${1:-}"
+  if [ -z "$cwd" ]; then
+    die 'image_tag: no project directory given'
+  fi
+  printf 'claude-sandbox:proj-%s' "$(printf '%s' "$cwd" | cksum | cut -d' ' -f1)"
+}
+
+# build_images — builds the per-project image from $BUILDER_DIR. Always: docker
+# build reuses the cache itself, a repeat run takes seconds. UID/GID/USERNAME
+# are host values so files in /work don't change owner (Dockerfile build-args).
+build_images() {
+  local tag
+  tag=$(image_tag "$(pwd -P)")
+  info "Building image $tag from $BUILDER_DIR ..."
+  docker build \
+    --build-arg UID="$(id -u)" \
+    --build-arg GID="$(id -g)" \
+    --build-arg USERNAME="$(id -un)" \
+    -t "$tag" "$BUILDER_DIR"
+}
+
+# clamp_mem total_bytes — container memory limit: floor(total/1048576) MiB,
+# clamped at 8192m (8 GB) at the top: a daemon with headroom never raises the limit.
+clamp_mem() { # clamp_mem total_bytes → stdout: ${N}m, N = min(8192, floor(bytes/1048576))
+  local total_bytes="${1:-0}"
+  printf '%dm' $(( total_bytes / 1048576 > 8192 ? 8192 : total_bytes / 1048576 ))
+}
+
+# mem_limit — the memory limit as it will actually apply: from the daemon's
+# MemTotal (host headroom stays untouched).
+mem_limit() { # mem_limit → stdout: ${N}m
+  clamp_mem "$(docker info --format '{{.MemTotal}}')"
+}
+
+# run_container — launches the container with args passed through to claude.
+# Exact call per contract: no-new-privileges + cap-drop=ALL + pids/cpus/memory,
+# --init, tmpfs on /tmp and /run, fixed DNS, TERM passed through,
+# /work = project (pwd -P), claude state = per-project home + host ~/.claude*.
+# No exec: docker run -it replaces the terminal session itself; the exit code
+# arrives through the plain command.
+run_container() {
+  docker run -it --rm \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    --pids-limit=512 --cpus=4.0 --memory "$(mem_limit)" \
+    --init --tmpfs /tmp --tmpfs /run \
+    --dns 1.1.1.1 --dns 8.8.8.8 \
+    --add-host=host.docker.internal:host-gateway \
+    -e TERM="${TERM:-xterm-256color}" \
+    --entrypoint /entrypoint.sh \
+    -v "$(pwd -P):/work" \
+    -v "$(pwd -P)/.claude-sandbox/home:/home/$USERNAME" \
+    -v "$HOME/.claude:/home/$USERNAME/.claude" \
+    -v "$HOME/.claude.json:/home/$USERNAME/.claude.json" \
+    "$(image_tag "$(pwd -P)")" \
+    claude --dangerously-skip-permissions "$@"
+}
+
+# deploy_files — per-project deployment (seed-if-missing): creates the dirs,
+# materializes files only in their absence; existing files are untouched. Idempotent.
+deploy_files() {
+  mkdir -p "$BUILDER_DIR" "$STATE_DIR"
+
+  # Mount targets for the nested file mounts of run_container ($HOME/.claude and
+  # $HOME/.claude.json): Docker Desktop (virtiofs) requires the mount target to
+  # exist on the host BEFORE the run — otherwise the first start fails with
+  # "mountpoint ... is outside of rootfs", exit 125. In the container both are
+  # shadowed by nested mounts from the host, so these are targets only:
+  # seed-if-missing, contents of existing files are not touched.
+  mkdir -p "$STATE_DIR/.claude"
+  [ -e "$STATE_DIR/.claude.json" ] || : > "$STATE_DIR/.claude.json"
+
+  # "variable → file" pairs: write only if the file is missing.
+  # entrypoint.sh goes to builder/ (the build's build-context): COPY entrypoint.sh /entrypoint.sh.
+  [ -f "$BUILDER_DIR/Dockerfile" ] || printf '%s' "$DOCKERFILE_MAIN" > "$BUILDER_DIR/Dockerfile"
+  [ -f "$BUILDER_DIR/entrypoint.sh" ] || printf '%s' "$ENTRYPOINT_SH" > "$BUILDER_DIR/entrypoint.sh"
+}
+
+# clear_project — full reset for the current project: kill any container on
+# the project's image, remove the image and the whole .claude-sandbox/ dir.
+# The image tag is per-directory (hashed from cwd), so this clears exactly
+# this project's image — other projects are untouched.
+clear_project() {
+  local tag
+  tag=$(image_tag "$(pwd -P)")
+
+  # A running session holds the script open, so normally there is nothing to
+  # kill; force-remove leftovers (e.g. a detached container) just in case.
+  docker ps -aq --filter "ancestor=$tag" | xargs docker rm -f >/dev/null 2>&1 || true
+  docker rmi -f "$tag" >/dev/null 2>&1 || true
+
+  rm -rf "$(pwd -P)/.claude-sandbox"
+  info "Cleared: container, image $tag and .claude-sandbox/ removed."
+}
+
+# rebuild_project — rebuild this project's image from scratch (--no-cache):
+# every layer re-runs (apt, node, claude, uv). Use when a Dockerfile edit
+# didn't take effect or the image drifted. Project state in .claude-sandbox/
+# is NOT touched.
+rebuild_project() {
+  require_docker
+  deploy_files
+  local tag
+  tag=$(image_tag "$(pwd -P)")
+  info "Rebuilding image $tag from $BUILDER_DIR (no cache) ..."
+  docker build \
+    --no-cache \
+    --build-arg UID="$(id -u)" \
+    --build-arg GID="$(id -g)" \
+    --build-arg USERNAME="$(id -un)" \
+    -t "$tag" "$BUILDER_DIR"
+}
+
+main() {
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      clear)   shift; clear_project; return 0 ;;
+      rebuild) shift; rebuild_project; return 0 ;;
+    esac
+  fi
+  require_docker
+  deploy_files
+  build_images
+  USERNAME="$(id -un)"
+  run_container "$@"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
