@@ -406,6 +406,14 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
   local root="${1:-}"
   local shadows="$root/.claude-sandbox/shadows"
   local p f
+  # The placeholder tree is regenerated from scratch on EVERY run: leftovers
+  # from an older ignore layout can sit here with the OPPOSITE entry type (a
+  # directory where a file is now matched, or vice versa). A failed
+  # `: >` in a stale shape dies silently (redirection failures don't raise
+  # errexit) and drops the bind recipe from the output — the container then
+  # half-launches or dies with "not a directory". Wipe first, heal always.
+  rm -rf "$shadows" 2>/dev/null || true
+  mkdir -p "$shadows"
   while IFS= read -r p; do
     # The ignore file itself: skipped here, appended below unconditionally.
     [ "$p" = ".claudesandboxignore" ] && continue
