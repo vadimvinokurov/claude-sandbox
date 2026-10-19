@@ -44,8 +44,9 @@
 # .claudesandboxignore
 #   Use to hide parts of the project from the container.
 #   
-#   An entry that matches a pattern — file OR folder, at any depth EMPTY in the container 
-#   (an empty tmpfs is mounted over it).
+#   An entry that matches a pattern — file OR folder, at any depth — stays
+#   untouched on the host but EMPTY in the container: a dir gets an empty
+#   tmpfs mounted over it, a file — an empty placeholder file bound over it.
 #
 #   Rules:
 #   1. Each line is one glob pattern; blank lines and '#' comments are skipped.
@@ -222,13 +223,21 @@ esac
 read_ignore_patterns() { # read_ignore_patterns file → stdout: patterns
   local file="${1:-}"
   [ -f "$file" ] || return 0
-  local line
+  local line=""
   while read -r line; do
     case "$line" in
       ''|'#'*) continue ;;
     esac
     printf '%s\n' "$line"
   done < "$file"
+  # The file may lack a trailing newline: on the last EOF pass read still
+  # fills the variable but returns false, so the while loop skipped the line.
+  # Nothing here to re-filter that the loop above hasn't done.
+  [ -n "$line" ] || return 0
+  case "$line" in
+    '#'*) return 0 ;;
+  esac
+  printf '%s\n' "$line"
 }
 
 # glob_ere pattern — converts a glob pattern to an ERE body: '*' becomes
@@ -358,6 +367,45 @@ mem_limit() { # mem_limit → stdout: ${N}m
   clamp_mem "$(docker info --format '{{.MemTotal}}')"
 }
 
+# shadow_args project_dir — prints the hiding recipe for every entry matched
+# by .claudesandboxignore, one entry per line, TAB-separated:
+#   tmpfs<TAB>/work/<dir>   a dir is hidden with an empty tmpfs;
+#   bind<TAB><src>:<target> a file can't take a tmpfs — runc refuses a mount
+#                           over a non-directory ("not a directory", which
+#                           killed the container at start) — so it hides
+#                           behind an EMPTY placeholder file, created under
+#                           .claude-sandbox/shadows/ mirroring the path and
+#                           bind-mounted over it. Placeholders live in
+#                           .claude-sandbox/ (never scanned), wiped by "clear".
+shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
+  local root="${1:-}"
+  local shadows="$root/.claude-sandbox/shadows"
+  local p f
+  while IFS= read -r p; do
+    if [ -d "$root/$p" ]; then
+      printf 'tmpfs\t/work/%s\n' "$p"
+    else
+      f="$shadows/$p"
+      mkdir -p "$(dirname "$f")"
+      : > "$f"
+      printf 'bind\t%s:/work/%s\n' "$(hostpath "$f")" "$p"
+    fi
+  done < <(ignore_scan "$root")
+}
+
+# shadow_mounts project_dir — shadow_args turned into docker argv words, one
+# per line (each line is exactly ONE word; the consumer reads with IFS= so
+# paths with spaces survive).
+shadow_mounts() { # shadow_mounts project_dir → stdout: docker argv words
+  local kind val
+  while IFS=$'\t' read -r kind val; do
+    case "$kind" in
+      tmpfs) printf '%s\n' "--tmpfs=$val" ;;
+      bind)  printf '%s\n%s\n' -v "$val" ;;
+    esac
+  done < <(shadow_args "$1")
+}
+
 # run_container — launches the container with args passed through to claude.
 # Exact call per contract: no-new-privileges + cap-drop=ALL + pids/cpus/memory,
 # --init, tmpfs on /tmp and /run, fixed DNS, TERM passed through,
@@ -368,15 +416,16 @@ run_container() {
   local project root
   root=$(pwd -P)
   project=$(hostpath "$root")
-  # Empty tmpfs mounts over every entry matched by .claudesandboxignore: the
-  # host content stays untouched, inside the container the entry is visible
-  # but empty. Container-only paths — no hostpath() conversion. The
-  # ${shadows[@]+...} guard is for the empty-array expansion on bash 3.2.
+  # Hiding mounts over every entry matched by .claudesandboxignore — empty
+  # tmpfs for dirs, empty placeholder files for files (see shadow_mounts):
+  # the host content stays untouched, inside the container the entry is
+  # visible but empty. The ${shadows[@]+...} guard is for the empty-array
+  # expansion on bash 3.2.
   local -a shadows=()
-  local p
-  while IFS= read -r p; do
-    shadows+=(--tmpfs "/work/$p")
-  done < <(ignore_scan "$root")
+  local word
+  while IFS= read -r word; do
+    shadows+=("$word")
+  done < <(shadow_mounts "$root")
   docker run -it --rm \
     --cap-drop=ALL --security-opt=no-new-privileges \
     --pids-limit=512 --cpus=4.0 --memory "$(mem_limit)" \
