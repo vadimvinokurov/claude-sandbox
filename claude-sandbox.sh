@@ -56,6 +56,19 @@
 #     src/generated       ← a nested path...
 #     */build             ← ...at any top level (front/build, back/build)
 #
+#   A line starting with '!' re-includes instead of hiding, and the LAST
+#   matching pattern decides (gitignore-style) — lists read top to bottom:
+#
+#     *              ← ignore every top-level entry (its subtree goes with it)
+#     !code          ← ...except code
+#     !prebuild      ← ...and prebuild
+#     code/lib3d_part  ← but still hide this one inside included code
+#
+#   Re-inclusion inside an IGNORED folder does not work: the empty tmpfs over
+#   the folder hides its whole subtree, so `!code/lib/src` stays hidden when
+#   `code/lib` itself is hidden. Hide the children instead and re-include the
+#   wanted one: `code/lib/*`, then `!code/lib/src` after it.
+#
 #   No file, or no matches → the run is exactly as before. .claude-sandbox/
 #   and .git are never touched or scanned.
 #
@@ -233,36 +246,53 @@ ignore_match() { # ignore_match pattern relpath → exit 0 iff match
 # ignore_scan project_dir — walks the project tree and prints the paths that
 # match the project's .claudesandboxignore patterns, relative to project_dir,
 # one per line (line-based: a filename containing a newline is not supported).
-# The walk stops at the depth of the deepest pattern; .claude-sandbox and
-# .git are never traversed or matched — the agent's own state and the repo
-# metadata are out of scope. No ignore file → no output, exit 0.
-ignore_scan() { # ignore_scan project_dir → stdout: matched rel paths
+# A line starting with '!' is a negation: it re-includes instead of hiding,
+# and the LAST matching pattern decides (gitignore-style), so lists read top
+# to bottom. The walk stops at the depth of the deepest pattern;
+# .claude-sandbox and .git are never traversed or matched — the agent's own
+# state and the repo metadata are out of scope. No ignore file → no output,
+# exit 0.
+ignore_scan() { # ignore_scan project_dir → stdout: shadowed rel paths
   local root="${1:-}"
   local file="$root/.claudesandboxignore"
   [ -f "$file" ] || return 0
 
-  # Patterns and their precompiled EREs live in parallel arrays; the walk's
-  # -maxdepth is the pattern with the most '/'-separated segments.
-  local -a patterns=() eres=()
-  local p nsegs maxdepth=1
+  # Patterns, their precompiled EREs and the match decision each pattern
+  # forces (plain → 1 = hide, '!' → 0 = re-include) in parallel arrays; the
+  # walk's -maxdepth is the pattern with the most '/'-separated segments.
+  local -a patterns=() eres=() forces=()
+  local p force slashes nsegs maxdepth=1
   while IFS= read -r p; do # read_ignore_patterns has cleaned: no blanks/comments
+    force=1
+    case "$p" in
+      '!'*) force=0; p="${p#!}" ;;
+    esac
     slashes="${p//[!\/]/}" # keep only the '/'s, count them
     nsegs=$(( ${#slashes} + 1 ))
     [ "$nsegs" -gt "$maxdepth" ] && maxdepth="$nsegs"
     patterns+=("$p")
     eres+=("$(glob_ere "$p")")
+    forces+=("$force")
   done < <(read_ignore_patterns "$file")
   [ "${#patterns[@]}" -gt 0 ] || return 0
 
-  local d rel i
+  # All patterns are evaluated per path (no early break: a later match
+  # overrides an earlier one); what survives as matched-and-not-negated
+  # is shadowed. A negated path inside an already-shadowed folder stays
+  # hidden — the empty tmpfs over the folder hides its whole subtree;
+  # ignore the children instead ('dir/*') to keep one of them visible.
+  local d rel i decision
   while IFS= read -r -d '' d; do
     rel="${d#"$root"/}"
+    decision=0
     for i in "${!patterns[@]}"; do
       if [[ "$rel" =~ ^${eres[i]}$ ]]; then
-        printf '%s\n' "$rel"
-        break # first matching pattern wins; further ones only duplicate the shadow
+        decision=${forces[i]} # last matching pattern decides (gitignore-style)
       fi
     done
+    if [ "$decision" = 1 ]; then
+      printf '%s\n' "$rel"
+    fi
   done < <(find "$root" -mindepth 1 -maxdepth "$maxdepth" \
              \( -name .claude-sandbox -o -name .git \) -prune -o -print0)
 }
