@@ -14,25 +14,24 @@
 #
 # Quick start:
 #   1. Install Docker
-#   2. Make it callable as `claude-sandbox` from any directory: from the
-#      folder where the script lies, run (the shell resolves $PWD itself):
+#   2. Make it callable as `claude-sandbox` from any directory:
+#      
+#      from the folder where the script saved, run (the shell resolves $PWD itself):
 #
 #      macOS / Linux:
-#        chmod +x "$PWD/claude-sandbox.sh" && \
-#          sudo ln -sf "$PWD/claude-sandbox.sh" /usr/local/bin/claude-sandbox
+#        chmod +x "$PWD/claude-sandbox.sh" && sudo ln -sf "$PWD/claude-sandbox.sh" /usr/local/bin/claude-sandbox
 #      No sudo rights? Use a user dir on PATH (~/.local/bin usually is):
 #          ln -sf "$PWD/claude-sandbox.sh" ~/.local/bin/claude-sandbox
 #
-#      Windows (it lands on the user PATH automatically):
+#      Windows:
 #        [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";" + "$($PWD.Path)", "User")
 
 #      Then run it from a project folder:     claude-sandbox
 #      Any extra args are passed to claude, e.g.:   claude-sandbox --resume
 #   3. First run: the image builds once (~1-2 min); after that rebuilds are
-#      instant (Docker layer cache). Log in inside the container: /login
-#      (macOS Keychain login from the host is not visible to the container).
+#      instant (Docker layer cache).
 #   4. Closing Claude or the terminal removes the container (--rm). Project
-#      state lives in ./.claude-sandbox/:
+#      state lives in ./.claude-sandbox/ per project:
 #        .claude-sandbox/home/     — agent home dir (caches, toolchains).
 #                                    Wipe it for a factory reset.
 #        .claude-sandbox/builder/  — Dockerfile + entrypoint.sh, seeded once;
