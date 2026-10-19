@@ -114,9 +114,21 @@ FROM ubuntu:26.04
 # apt must not ask interactive questions — nobody inside the build answers them.
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Minimal package set in one layer, with the apt cache cleaned afterwards.
+# Package set in one layer, with the apt cache cleaned afterwards:
+#   curl+ca-certificates+zsh+less — plumbing for claude/uv/shell;
+#   build-essential — g++, make, libc headers (the baseline C++ toolchain);
+#   cmake + ninja-build — build system, ninja as the fast CMake generator;
+#   pkg-config + ccache — dependency lookup and fast rebuilds;
+#   clang + lldb + gdb — second compiler and debuggers (lldb for clang, gdb for g++);
+#   clang-tidy + clang-format — static analysis and formatting the agent can run;
+#   libgtest-dev + libgmock-dev — googletest/googlemock: headers, static libs
+#     and CMake configs (/usr/include/gtest, libgtest*.a, gtest::gtest target).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git zsh less build-essential && \
+    apt-get install -y --no-install-recommends \
+      curl ca-certificates git zsh less \
+      build-essential cmake ninja-build pkg-config ccache \
+      clang lldb gdb clang-tidy clang-format \
+      libgtest-dev libgmock-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # User with host UID/GID (build-args) — files in /work don't change owner.
