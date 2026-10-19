@@ -34,10 +34,11 @@
 #      state lives in ./.claude-sandbox/ per project:
 #        .claude-sandbox/home/     — agent home dir (caches, toolchains).
 #                                    Wipe it for a factory reset.
-#        .claude-sandbox/builder/  — Dockerfile + entrypoint.sh, seeded once;
-#                                    edit the Dockerfile per project and it
-#                                    will NOT be overwritten (delete it to
-#                                    re-seed the default).
+#        .claude-sandbox/builder/  — Dockerfile + entrypoint.sh, rewritten
+#                                    from the packaged versions on EVERY
+#                                    run: a project keeps no own copies, and
+#                                    an in-container agent cannot poison the
+#                                    next launch through them.
 #   5. Your host ~/.claude and ~/.claude.json are mounted read-write into the
 #      container (shared login, sessions, history — BOTH ways).
 #
@@ -443,8 +444,14 @@ run_container() {
     claude --dangerously-skip-permissions "$@"
 }
 
-# deploy_files — per-project deployment (seed-if-missing): creates the dirs,
-# materializes files only in their absence; existing files are untouched. Idempotent.
+# deploy_files — per-project deployment. The dirs are created if missing; the
+# home state (mount targets) is seeded-if-missing and never rewritten. The
+# builder files, on the contrary, are REWRITTEN from the launcher's packaged
+# versions on EVERY run: an in-container agent can write into /work, so it
+# must not be able to poison the next build through builder/ — whatever it
+# tampers with there is wiped on the next start (security review item 4;
+# per-project Dockerfile customization is consciously given up for this).
+# Idempotent.
 deploy_files() {
   mkdir -p "$BUILDER_DIR" "$STATE_DIR"
 
@@ -457,10 +464,11 @@ deploy_files() {
   mkdir -p "$STATE_DIR/.claude"
   [ -e "$STATE_DIR/.claude.json" ] || : > "$STATE_DIR/.claude.json"
 
-  # "variable → file" pairs: write only if the file is missing.
-  # entrypoint.sh goes to builder/ (the build's build-context): COPY entrypoint.sh /entrypoint.sh.
-  [ -f "$BUILDER_DIR/Dockerfile" ] || printf '%s' "$DOCKERFILE_MAIN" > "$BUILDER_DIR/Dockerfile"
-  [ -f "$BUILDER_DIR/entrypoint.sh" ] || printf '%s' "$ENTRYPOINT_SH" > "$BUILDER_DIR/entrypoint.sh"
+  # Builder files: always from the packaged versions. entrypoint.sh lands in
+  # builder/ (the build's build-context) so COPY entrypoint.sh /entrypoint.sh
+  # picks it up.
+  printf '%s' "$DOCKERFILE_MAIN" > "$BUILDER_DIR/Dockerfile"
+  printf '%s' "$ENTRYPOINT_SH" > "$BUILDER_DIR/entrypoint.sh"
 }
 
 # clear_project — full reset for the current project: kill any container on
