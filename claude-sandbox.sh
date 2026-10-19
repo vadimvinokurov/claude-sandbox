@@ -41,35 +41,42 @@
 #   5. Your host ~/.claude and ~/.claude.json are mounted read-write into the
 #      container (shared login, sessions, history — BOTH ways).
 #
-# Hiding parts of the project (.claudesandboxignore):
-#   An optional file next to .claude-sandbox/. Each line is a glob pattern
-#   ('*' = any characters within ONE path segment; '#' comments and blank
-#   lines are ignored); every project entry it matches — file or folder, at
-#   any depth — stays untouched on the host but is EMPTY inside the container
-#   (an empty tmpfs is mounted over it). Patterns without '/' match top-level
-#   entries only; with '/' — a path from the project root, e.g.:
+# .claudesandboxignore
+#   Use to hide parts of the project from the container.
+#   
+#   An entry that matches a pattern — file OR folder, at any depth EMPTY in the container 
+#   (an empty tmpfs is mounted over it).
 #
-#     node_modules        ← an exact top-level name
-#     .env                ← a file works the same way (visible, empty)
-#     *secret*            ← any top-level name containing "secret"
-#     src/generated       ← a nested path...
-#     */build             ← ...at any top level (front/build, back/build)
+#   Rules:
+#   1. Each line is one glob pattern; blank lines and '#' comments are skipped.
+#   2. '*' matches anything within ONE path segment — it never crosses '/'.
+#   3. A line starting with '!' re-includes a path instead of hiding it.
+#   4. A pattern without '/' matches top-level entries only; a pattern with
+#      '/' is a full path from the project root (src/generated).
+#   5. The LAST matching pattern wins (gitignore-style) — examples below read
+#      exactly like a real file, line after line:
 #
-#   A line starting with '!' re-includes instead of hiding, and the LAST
-#   matching pattern decides (gitignore-style) — lists read top to bottom:
+#   Typical use — sandbox in a big folder, show only two dirs, hide one lib:
 #
-#     *              ← ignore every top-level entry (its subtree goes with it)
-#     !code          ← ...except code
-#     !prebuild      ← ...and prebuild
-#     code/lib3d_part  ← but still hide this one inside included code
+#     *              ← hide every top-level entry (subtree rides along)
+#     !code          ← ...but show code
+#     !config        ← ...and config
+#     code/lib3d_part  ← ...yet still hide this inside code
 #
-#   Re-inclusion inside an IGNORED folder does not work: the empty tmpfs over
-#   the folder hides its whole subtree, so `!code/lib/src` stays hidden when
-#   `code/lib` itself is hidden. Hide the children instead and re-include the
-#   wanted one: `code/lib/*`, then `!code/lib/src` after it.
+#   More examples:
+#     node_modules       ← hide name (.env — any top-level file)
+#     *secret*           ← hide any top-level name containing "secret"
+#     */build            ← hide 'build' in every top-level dir (front/build, ...)
 #
-#   No file, or no matches → the run is exactly as before. .claude-sandbox/
-#   and .git are never touched or scanned.
+#   '!' can't reveal anything under an already-hidden folder: the empty tmpfs
+#   empties the whole subtree. Hide the children and re-include the wanted:
+#   Bad:
+#     code/lib           ← hide code/lib
+#     !code/lib/src      ← ...try to keep src (and everything under it)
+#   Good:
+#     code/lib/*         ← hide code/lib's children...
+#     !code/lib/src      ← ...but keep src (and everything under it)
+#
 #
 # Security notes (accepted trade-offs):
 #   - Container is non-root, no sudo, no caps, no-new-privileges, limited
