@@ -125,13 +125,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   clang + lldb + gdb — second compiler and debuggers (lldb for clang, gdb for g++);
 #   clang-tidy + clang-format — static analysis and formatting the agent can run;
 #   libgtest-dev + libgmock-dev — googletest/googlemock: headers, static libs
-#     and CMake configs (/usr/include/gtest, libgtest*.a, gtest::gtest target).
+#     and CMake configs (/usr/include/gtest, libgtest*.a, gtest::gtest target);
+#   elfutils — readelf/nm/strip/addr2line: inspecting ELF binaries and core
+#     dumps during debugging.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       curl ca-certificates git zsh less \
       build-essential cmake ninja-build pkg-config ccache \
       clang lldb gdb clang-tidy clang-format \
-      libgtest-dev libgmock-dev && \
+      libgtest-dev libgmock-dev elfutils && \
     rm -rf /var/lib/apt/lists/*
 
 # User with host UID/GID (build-args) — files in /work don't change owner.
