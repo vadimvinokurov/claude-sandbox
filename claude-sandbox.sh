@@ -47,7 +47,8 @@
 #   
 #   An entry that matches a pattern — file OR folder, at any depth — stays
 #   untouched on the host but EMPTY in the container: a dir gets an empty
-#   tmpfs mounted over it, a file — an empty placeholder file bound over it.
+#   tmpfs mounted over it, a file — an empty read-only placeholder file
+#   bound over it.
 #
 #   Rules:
 #   1. Each line is one glob pattern; blank lines and '#' comments are skipped.
@@ -390,7 +391,12 @@ mem_limit() { # mem_limit → stdout: ${N}m
 #                           killed the container at start) — so it hides
 #                           behind an EMPTY placeholder file, created under
 #                           .claude-sandbox/shadows/ mirroring the path and
-#                           bind-mounted over it. Placeholders live in
+#                           bind-mounted over it, READ-ONLY: the agent can
+#                           see the path and nothing more, its writes bounce
+#                           (review item 7; without :ro the agent could
+#                           "re-hide" content mid-session via
+#                           .claude-sandbox/shadows/<path>). Placeholders
+#                           live in
 #                           .claude-sandbox/ (never scanned), wiped by "clear".
 shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
   local root="${1:-}"
@@ -405,7 +411,7 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
       f="$shadows/$p"
       mkdir -p "$(dirname "$f")"
       : > "$f"
-      printf 'bind\t%s:/work/%s\n' "$(hostpath "$f")" "$p"
+      printf 'bind\t%s:/work/%s:ro\n' "$(hostpath "$f")" "$p"
     fi
   done < <(ignore_scan "$root")
   # .claudesandboxignore is ALWAYS shadowed, pattern or no pattern: it is
@@ -417,7 +423,7 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
     mkdir -p "$shadows"
     f="$shadows/.claudesandboxignore"
     : > "$f"
-    printf 'bind\t%s:/work/.claudesandboxignore\n' "$(hostpath "$f")"
+    printf 'bind\t%s:/work/.claudesandboxignore:ro\n' "$(hostpath "$f")"
   fi
 }
 
