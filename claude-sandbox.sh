@@ -417,13 +417,21 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
   while IFS= read -r p; do
     # The ignore file itself: skipped here, appended below unconditionally.
     [ "$p" = ".claudesandboxignore" ] && continue
-    if [ -d "$root/$p" ]; then
+    # Hide only plain files and plain dirs. A symlink/junction (even to a
+    # valid dir) gets SKIPPED with a warning: bash and the container file
+    # system may disagree on what a reparse point is (virtiofs/drvfs on
+    # Windows does), a mount target resolves THROUGH the link, and a
+    # mismatch dies at container start with "not a directory" — warning and
+    # leaving the entry visible beats a session that doesn't launch.
+    if [ -d "$root/$p" ] && [ ! -L "$root/$p" ]; then
       printf 'tmpfs\t/work/%s\n' "$p"
-    else
+    elif [ -f "$root/$p" ] && [ ! -L "$root/$p" ]; then
       f="$shadows/$p"
       mkdir -p "$(dirname "$f")"
       : > "$f"
       printf 'bind\t%s:/work/%s:ro\n' "$(hostpath "$f")" "$p"
+    else
+      printf 'WARN: .claudesandboxignore: entry "%s" is a symbolic link, junction or missing — not hidden, shown as is\n' "$p" >&2
     fi
   done < <(ignore_scan "$root")
   # .claudesandboxignore is ALWAYS shadowed, pattern or no pattern: it is
