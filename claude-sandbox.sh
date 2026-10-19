@@ -127,13 +127,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   libgtest-dev + libgmock-dev — googletest/googlemock: headers, static libs
 #     and CMake configs (/usr/include/gtest, libgtest*.a, gtest::gtest target);
 #   elfutils — readelf/nm/strip/addr2line: inspecting ELF binaries and core
-#     dumps during debugging.
+#     dumps during debugging;
+#   libdw-dev — libdw headers: DWARF/debug-info tooling (e.g. for custom
+#     unwinding/profiling tooling the agent may build or link).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       curl ca-certificates git zsh less \
       build-essential cmake ninja-build pkg-config ccache \
       clang lldb gdb clang-tidy clang-format \
-      libgtest-dev libgmock-dev elfutils && \
+      libgtest-dev libgmock-dev elfutils libdw-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # User with host UID/GID (build-args) — files in /work don't change owner.
