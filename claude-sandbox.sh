@@ -79,6 +79,8 @@
 #     code/lib/*         ← hide code/lib's children...
 #     !code/lib/src      ← ...but keep src (and everything under it)
 #
+#   The ignore file itself is ALWAYS hidden from the agent: in the container
+#   it reads as empty, and its edits never reach the host copy.
 #
 # Security notes (accepted trade-offs):
 #   - Container is non-root, no sudo, no caps, no-new-privileges, limited
@@ -395,6 +397,8 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
   local shadows="$root/.claude-sandbox/shadows"
   local p f
   while IFS= read -r p; do
+    # The ignore file itself: skipped here, appended below unconditionally.
+    [ "$p" = ".claudesandboxignore" ] && continue
     if [ -d "$root/$p" ]; then
       printf 'tmpfs\t/work/%s\n' "$p"
     else
@@ -404,6 +408,17 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
       printf 'bind\t%s:/work/%s\n' "$(hostpath "$f")" "$p"
     fi
   done < <(ignore_scan "$root")
+  # .claudesandboxignore is ALWAYS shadowed, pattern or no pattern: it is
+  # user-writable policy the in-container agent must neither read nor tamper
+  # with — the shadow leaves an empty file in the container and routes the
+  # agent's writes into the disposable placeholder, not into the host file
+  # (security review item 5). No file → nothing to hide.
+  if [ -f "$root/.claudesandboxignore" ]; then
+    mkdir -p "$shadows"
+    f="$shadows/.claudesandboxignore"
+    : > "$f"
+    printf 'bind\t%s:/work/.claudesandboxignore\n' "$(hostpath "$f")"
+  fi
 }
 
 # shadow_mounts project_dir — shadow_args turned into docker argv words, one
