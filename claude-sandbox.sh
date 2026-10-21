@@ -41,6 +41,11 @@
 #                                    next launch through them.
 #   5. Your host ~/.claude and ~/.claude.json are mounted read-write into the
 #      container (shared login, sessions, history — BOTH ways).
+#   6. macOS note, not a bug here: in the live claude TUI ⌘C may copy
+#      nothing — the TUI turns on mouse reporting, a plain mouse drag never
+#      becomes a terminal selection (and the constant redraw erases it).
+#      Hold Option (or fn) while dragging to force a real selection; ⌘V is
+#      unaffected (paste needs no selection). Works with or without Docker.
 #
 # .claudesandboxignore
 #   Use to hide parts of the project from the container.
@@ -85,8 +90,15 @@
 #
 # Security notes (accepted trade-offs):
 #   - Container is non-root, no sudo, no caps, no-new-privileges, limited
-#     pids/cpus/memory, tmpfs on /tmp and /run, fixed public DNS.
+#     pids/cpus/memory, tmpfs on /tmp and /run.
 #   - The container has FULL network access (internet + LAN + host ports).
+#   - The container runs DIRECTLY on the host's network stack
+#     (--network=host): every port a dev server opens inside is immediately
+#     on the host — localhost:<same port>, no -p publishing needed — and the
+#     host resolver is used (a fixed container DNS breaks a corporate VPN).
+#     Cost: no network-stack isolation. Needs the daemon's host networking
+#     support (Docker Desktop >= 4.34 with it enabled in the daemon settings,
+#     or OrbStack, or plain Linux).
 #   - The mounted ~/.claude is writable: an in-container agent could poison
 #     host hooks in ~/.claude settings. This is a conscious decision.
 #   - Anything Claude deletes in /work is deleted on the host — keep /work
@@ -480,12 +492,19 @@ run_container() {
   while IFS= read -r word; do
     shadows+=("$word")
   done < <(shadow_mounts "$root")
+  # Network: --network=host, always. The container shares the host's network
+  # stack, so a dev server the agent starts inside is immediately reachable
+  # as localhost:<same port> on the host — no -p publishing and no port
+  # contract the agent would have to know; the host resolver answers
+  # LAN/VPN names (a fixed container DNS breaks a corporate VPN). Cost: no
+  # network-stack isolation. Needs the daemon's host networking support
+  # (Docker Desktop >= 4.34 with it enabled in the daemon settings, or
+  # OrbStack, or plain Linux).
   docker run -it --rm \
     --cap-drop=ALL --security-opt=no-new-privileges \
     --pids-limit=512 --cpus=4.0 --memory "$(mem_limit)" \
     --init --tmpfs /tmp --tmpfs /run \
-    --dns 1.1.1.1 --dns 8.8.8.8 \
-    --add-host=host.docker.internal:host-gateway \
+    --network=host \
     -e TERM="${TERM:-xterm-256color}" \
     --entrypoint /entrypoint.sh \
     -v "$project:/work" \
