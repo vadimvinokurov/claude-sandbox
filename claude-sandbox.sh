@@ -8,9 +8,11 @@
 # Subcommands (the first argument; anything else is passed to claude):
 #   claude-sandbox.sh           — start Claude Code in the sandbox (default)
 #   claude-sandbox.sh clear     — full reset: remove this project's .claude-sandbox/
-#                                 dir and its image (caches/toolchains re-download)
-#   claude-sandbox.sh rebuild   — rebuild this project's image from scratch
-#                                 (--no-cache: apt, node, claude, uv all re-run)
+#                                 dir and the image (caches/toolchains re-download)
+#   claude-sandbox.sh rebuild   — rebuild the image from scratch (--no-cache: apt,
+#                                 node, claude, uv all re-run)
+#   claude-sandbox.sh shell     — a plain interactive zsh in the same sandbox
+#                                 (same mounts/isolation; for debugging the env)
 #
 # Quick start:
 #   1. Install Docker
@@ -31,16 +33,30 @@
 #   3. First run: the image builds once (~1-2 min); after that rebuilds are
 #      instant (Docker layer cache).
 #   4. Closing Claude or the terminal removes the container (--rm). Project
-#      state lives in ./.claude-sandbox/ per project:
-#        .claude-sandbox/home/     — agent home dir (caches, toolchains).
-#                                    Wipe it for a factory reset.
-#        .claude-sandbox/builder/  — Dockerfile + entrypoint.sh, rewritten
-#                                    from the packaged versions on EVERY
-#                                    run: a project keeps no own copies, and
-#                                    an in-container agent cannot poison the
-#                                    next launch through them.
+#      state lives in ./.claude-sandbox/ per project — and .claude-sandbox/
+#      IS the agent home dir (caches, toolchains); wipe it for a factory
+#      reset:
+#        .claude-sandbox/.claude-sandbox/build/  — Dockerfile + entrypoint.sh,
+#                                    rewritten from the packaged versions on
+#                                    EVERY run: a project keeps no own copies,
+#                                    and an in-container agent cannot poison
+#                                    the next launch through them.
+#        .claude-sandbox/.claude-sandbox/shadow/ — empty placeholder files
+#                                    behind the hidden .claudesandboxignore
+#                                    entries, regenerated on every run.
+#                                    The nested .claude-sandbox/ dir inside
+#                                    the home keeps plumbing from mixing
+#                                    with the home state.
 #   5. Your host ~/.claude and ~/.claude.json are mounted read-write into the
 #      container (shared login, sessions, history — BOTH ways).
+#      Your host ~/.gitconfig, ~/.ssh and ~/.config/gh are mounted READ-ONLY:
+#      the agent can git push over ssh and run gh with your credentials, but
+#      cannot alter the keys or the config on the host (a gh auth still has to
+#      happen on the host first). Without a host identity the entrypoint
+#      falls back to "Claude Agent <agent@claude.ai>" in the project's state
+#      home; a host gitconfig WITHOUT an identity gets a startup warning
+#      (GPG-signed commits from a signing host config need ~/.gnupg — not
+#      mounted; sign on the host).
 #   6. macOS note, not a bug here: in the live claude TUI ⌘C may copy
 #      nothing — the TUI turns on mouse reporting, a plain mouse drag never
 #      becomes a terminal selection (and the constant redraw erases it).
@@ -101,6 +117,9 @@
 #     or OrbStack, or plain Linux).
 #   - The mounted ~/.claude is writable: an in-container agent could poison
 #     host hooks in ~/.claude settings. This is a conscious decision.
+#   - ~/.gitconfig, ~/.ssh and ~/.config/gh are mounted READ-ONLY: the agent
+#     may authenticate with the host credentials but not damage or replace
+#     them. They are still readable — keys are exposed to the agent.
 #   - Anything Claude deletes in /work is deleted on the host — keep /work
 #     under version control.
 #
@@ -114,12 +133,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 # shellcheck disable=SC2034  # used by later stages
-BUILDER_DIR=".claude-sandbox/builder"
+SANDBOX_DIR=".claude-sandbox" # per-project dir; IS the container home directly
 # shellcheck disable=SC2034
-STATE_DIR=".claude-sandbox/home"
+BUILDER_DIR=".claude-sandbox/.claude-sandbox/build"
+# shellcheck disable=SC2034
+SHADOWS_DIR=".claude-sandbox/.claude-sandbox/shadow"
 
 # Files materialized into the per-project dir (image Dockerfile + entrypoint.
-# Both are seeded into builder/ — the build's build-context, where COPY picks
+# Both are seeded into build/ — the build's build-context, where COPY picks
 # up the entrypoint from).
 # shellcheck disable=SC2016  # deliberately leave $ unexpanded in heredoc vars
 read -r -d '' DOCKERFILE_MAIN <<'EOF_PLACEHOLDER' || true
@@ -130,7 +151,9 @@ FROM ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Package set in one layer, with the apt cache cleaned afterwards:
-#   curl+ca-certificates+zsh+less — plumbing for claude/uv/shell;
+#   curl+ca-certificates+git+gh+zsh+less — plumbing for claude/uv/shell; gh is
+#     the GitHub CLI (pull requests/issues from inside the sandbox; its login
+#     comes from the host mount, read-only, see the security notes);
 #   build-essential — g++, make, libc headers (the baseline C++ toolchain);
 #   cmake + ninja-build — build system, ninja as the fast CMake generator;
 #   pkg-config + ccache — dependency lookup and fast rebuilds;
@@ -144,7 +167,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     unwinding/profiling tooling the agent may build or link).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      curl ca-certificates git zsh less \
+      curl ca-certificates git gh zsh less \
       build-essential cmake ninja-build pkg-config ccache \
       clang lldb gdb clang-tidy clang-format \
       libgtest-dev libgmock-dev elfutils libdw-dev && \
@@ -186,7 +209,7 @@ USER ${USERNAME}
 # the state dir at container runtime.
 ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
 
-# Entrypoint is copied executable: the seed file in builder/ is mode 644,
+# Entrypoint is copied executable: the seed file in build/ is mode 644,
 # COPY preserves the source mode, hence --chmod=555 (BuildKit).
 COPY --chmod=555 entrypoint.sh /entrypoint.sh
 
@@ -211,11 +234,22 @@ export PATH="$HOME/.local/bin:$PATH"
 umask 022
 INNER
 
-# ~/.gitconfig: without an identity git rejects the first commit.
-[ -f "$HOME/.gitconfig" ] || {
-  git config --global user.name "Claude Agent"
-  git config --global user.email "agent@claude.ai"
+# ~/.gitconfig: without an identity git rejects the first commit. The host
+# config may be mounted read-only (SANDBOX_GITCONFIG_RO): there the host
+# identity wins and the fallback is skipped — a write into the read-only file
+# would die under set -eu; an incomplete host config gets a warning instead.
+id_ok() {
+  git config --global user.name >/dev/null 2>&1 && \
+    git config --global user.email >/dev/null 2>&1
 }
+if ! id_ok; then
+  if [ "${SANDBOX_GITCONFIG_RO:-0}" = "1" ]; then
+    printf 'WARN: host ~/.gitconfig is mounted read-only but has no user.name/user.email — set them on the host\n' >&2
+  else
+    git config --global user.name "Claude Agent"
+    git config --global user.email "agent@claude.ai"
+  fi
+fi
 
 exec "$@"
 EOF_PLACEHOLDER
@@ -361,23 +395,25 @@ require_docker() {
 # main
 # ---------------------------------------------------------------------------
 
-# image_tag cwd — deterministic image tag for a project directory:
-# claude-sandbox:proj-<crc32>. cksum is stable on one host, the tag characters
-# are safe for docker (lowercase name + digits), the tag is unique per directory.
-image_tag() { # image_tag cwd → stdout: claude-sandbox:proj-<crc>
-  local cwd="${1:-}"
-  if [ -z "$cwd" ]; then
-    die 'image_tag: no project directory given'
-  fi
-  printf 'claude-sandbox:proj-%s' "$(printf '%s' "$cwd" | cksum | cut -d' ' -f1)"
+# image_tag — the image tag, SHARED across all projects of the user: the
+# build args (UID/GID/USERNAME) decide everything the image contains, so one
+# image per user suffices — a second project starts instantly and disk holds
+# one image, not one per directory. `clear` may remove the shared image;
+# other projects rebuild from the layer cache in seconds. Username chars
+# outside the docker tag alphabet ([a-zA-Z0-9._-]) become '_' (a macOS login
+# may contain spaces/dots that useradd/tag rules reject).
+image_tag() { # image_tag → stdout: claude-sandbox:u<uid>-g<gid>-<user>
+  printf 'claude-sandbox:u%s-g%s-%s' \
+    "$(id -u)" "$(id -g)" "$(id -un | sed -e 's/[^a-zA-Z0-9._-]/_/g')"
 }
 
-# build_images — builds the per-project image from $BUILDER_DIR. Always: docker
-# build reuses the cache itself, a repeat run takes seconds. UID/GID/USERNAME
-# are host values so files in /work don't change owner (Dockerfile build-args).
+# build_images — builds the shared per-user image from $BUILDER_DIR. Always:
+# docker build reuses the layer cache itself, a repeat run takes seconds.
+# UID/GID/USERNAME are host values so files in /work don't change owner
+# (Dockerfile build-args); they key the image tag too, see image_tag.
 build_images() {
   local tag
-  tag=$(image_tag "$(pwd -P)")
+  tag=$(image_tag)
   info "Building image $tag from $BUILDER_DIR ..."
   docker build \
     --build-arg UID="$(id -u)" \
@@ -406,17 +442,18 @@ mem_limit() { # mem_limit → stdout: ${N}m
 #                           over a non-directory ("not a directory", which
 #                           killed the container at start) — so it hides
 #                           behind an EMPTY placeholder file, created under
-#                           .claude-sandbox/shadows/ mirroring the path and
-#                           bind-mounted over it, READ-ONLY: the agent can
+#                           .claude-sandbox/.claude-sandbox/shadow/ (it
+#                           mirrors the path), bind-mounted over it,
+#                           READ-ONLY: the agent can
 #                           see the path and nothing more, its writes bounce
 #                           (review item 7; without :ro the agent could
 #                           "re-hide" content mid-session via
-#                           .claude-sandbox/shadows/<path>). Placeholders
-#                           live in
-#                           .claude-sandbox/ (never scanned), wiped by "clear".
+#                           .claude-sandbox/.claude-sandbox/shadow/<path>).
+#                           Placeholders live in .claude-sandbox/ (never
+#                           scanned), wiped by "clear".
 shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
   local root="${1:-}"
-  local shadows="$root/.claude-sandbox/shadows"
+  local shadows="$root/$SHADOWS_DIR"
   local p f
   # The placeholder tree is regenerated from scratch on EVERY run: leftovers
   # from an older ignore layout can sit here with the OPPOSITE entry type (a
@@ -472,13 +509,13 @@ shadow_mounts() { # shadow_mounts project_dir → stdout: docker argv words
   done < <(shadow_args "$1")
 }
 
-# run_container — launches the container with args passed through to claude.
-# Exact call per contract: no-new-privileges + cap-drop=ALL + pids/cpus/memory,
-# --init, tmpfs on /tmp and /run, fixed DNS, TERM passed through,
-# /work = project (pwd -P), claude state = per-project home + host ~/.claude*.
+# run_in_sandbox cmd... — docker run over the shared plumbing (isolation,
+# mounts, shadows, host networking) and cmd executed inside. The argv tail —
+# WHAT runs — comes from the caller: claude for the normal session, a plain
+# interactive zsh for the `shell` subcommand.
 # No exec: docker run -it replaces the terminal session itself; the exit code
 # arrives through the plain command.
-run_container() {
+run_in_sandbox() { # run_in_sandbox [cmd...]
   local project root
   root=$(pwd -P)
   project=$(hostpath "$root")
@@ -492,6 +529,23 @@ run_container() {
   while IFS= read -r word; do
     shadows+=("$word")
   done < <(shadow_mounts "$root")
+  # Host identity, read-only: the agent can push to remotes and run gh with
+  # the host credentials, but cannot tamper with the keys or the config on
+  # the host (a gh login still happens on the host). Each path is mounted
+  # only when it exists — a -v to a missing host path makes docker create a
+  # stray directory. SANDBOX_GITCONFIG_RO tells the entrypoint to skip its
+  # identity fallback: it could not write into the read-only mount anyway.
+  local -a identity=()
+  if [ -f "$HOME/.gitconfig" ]; then
+    identity+=(-v "$(hostpath "$HOME")/.gitconfig:/home/$USERNAME/.gitconfig:ro")
+    identity+=(-e SANDBOX_GITCONFIG_RO=1)
+  fi
+  if [ -d "$HOME/.ssh" ]; then
+    identity+=(-v "$(hostpath "$HOME")/.ssh:/home/$USERNAME/.ssh:ro")
+  fi
+  if [ -d "$HOME/.config/gh" ]; then
+    identity+=(-v "$(hostpath "$HOME")/.config/gh:/home/$USERNAME/.config/gh:ro")
+  fi
   # Network: --network=host, always. The container shares the host's network
   # stack, so a dev server the agent starts inside is immediately reachable
   # as localhost:<same port> on the host — no -p publishing and no port
@@ -508,48 +562,56 @@ run_container() {
     -e TERM="${TERM:-xterm-256color}" \
     --entrypoint /entrypoint.sh \
     -v "$project:/work" \
-    -v "$project/.claude-sandbox/home:/home/$USERNAME" \
+    -v "$project/.claude-sandbox:/home/$USERNAME" \
     -v "$(hostpath "$HOME")/.claude:/home/$USERNAME/.claude" \
     -v "$(hostpath "$HOME")/.claude.json:/home/$USERNAME/.claude.json" \
+    ${identity[@]+"${identity[@]}"} \
     ${shadows[@]+"${shadows[@]}"} \
-    "$(image_tag "$(pwd -P)")" \
-    claude --dangerously-skip-permissions "$@"
+    "$(image_tag)" \
+    "$@"
+}
+
+# run_container — the normal session: claude with the permission bypass.
+run_container() { # run_container [claude args...]
+  run_in_sandbox claude --dangerously-skip-permissions "$@"
 }
 
 # deploy_files — per-project deployment. The dirs are created if missing; the
 # home state (mount targets) is seeded-if-missing and never rewritten. The
 # builder files, on the contrary, are REWRITTEN from the launcher's packaged
 # versions on EVERY run: an in-container agent can write into /work, so it
-# must not be able to poison the next build through builder/ — whatever it
+# must not be able to poison the next build through build/ — whatever it
 # tampers with there is wiped on the next start (security review item 4;
 # per-project Dockerfile customization is consciously given up for this).
 # Idempotent.
 deploy_files() {
-  mkdir -p "$BUILDER_DIR" "$STATE_DIR"
+  mkdir -p "$BUILDER_DIR" "$SANDBOX_DIR"
 
-  # Mount targets for the nested file mounts of run_container ($HOME/.claude and
-  # $HOME/.claude.json): Docker Desktop (virtiofs) requires the mount target to
-  # exist on the host BEFORE the run — otherwise the first start fails with
-  # "mountpoint ... is outside of rootfs", exit 125. In the container both are
-  # shadowed by nested mounts from the host, so these are targets only:
+  # Mount targets for the nested mounts of run_container: $HOME/.claude and
+  # $HOME/.claude.json, plus the read-only identity paths ~/.gitconfig,
+  # ~/.ssh and ~/.config/gh. The home dir itself IS $SANDBOX_DIR now.
+  # Docker Desktop (virtiofs) requires the mount target to exist on the host
+  # BEFORE the run — otherwise the first start fails with "mountpoint ...
+  # is outside of rootfs", exit 125. In the container these are targets only:
   # seed-if-missing, contents of existing files are not touched.
-  mkdir -p "$STATE_DIR/.claude"
-  [ -e "$STATE_DIR/.claude.json" ] || : > "$STATE_DIR/.claude.json"
+  mkdir -p "$SANDBOX_DIR/.claude" "$SANDBOX_DIR/.ssh" "$SANDBOX_DIR/.config/gh"
+  [ -e "$SANDBOX_DIR/.claude.json" ] || : > "$SANDBOX_DIR/.claude.json"
+  [ -e "$SANDBOX_DIR/.gitconfig" ] || : > "$SANDBOX_DIR/.gitconfig"
 
   # Builder files: always from the packaged versions. entrypoint.sh lands in
-  # builder/ (the build's build-context) so COPY entrypoint.sh /entrypoint.sh
+  # build/ (the build's build-context) so COPY entrypoint.sh /entrypoint.sh
   # picks it up.
   printf '%s' "$DOCKERFILE_MAIN" > "$BUILDER_DIR/Dockerfile"
   printf '%s' "$ENTRYPOINT_SH" > "$BUILDER_DIR/entrypoint.sh"
 }
 
 # clear_project — full reset for the current project: kill any container on
-# the project's image, remove the image and the whole .claude-sandbox/ dir.
-# The image tag is per-directory (hashed from cwd), so this clears exactly
-# this project's image — other projects are untouched.
+# the shared per-user image, remove the image and the whole .claude-sandbox/
+# dir. The image is SHARED across this user's projects (see image_tag): after
+# a clear, other projects rebuild from the layer cache in seconds.
 clear_project() {
   local tag
-  tag=$(image_tag "$(pwd -P)")
+  tag=$(image_tag)
 
   # A running session holds the script open, so normally there is nothing to
   # kill; force-remove leftovers (e.g. a detached container) just in case.
@@ -560,15 +622,15 @@ clear_project() {
   info "Cleared: container, image $tag and .claude-sandbox/ removed."
 }
 
-# rebuild_project — rebuild this project's image from scratch (--no-cache):
-# every layer re-runs (apt, node, claude, uv). Use when a Dockerfile edit
-# didn't take effect or the image drifted. Project state in .claude-sandbox/
-# is NOT touched.
+# rebuild_project — rebuild the shared per-user image from scratch
+# (--no-cache): every layer re-runs (apt, node, claude, uv). Use when a
+# Dockerfile edit didn't take effect or the image drifted. Project state in
+# .claude-sandbox/ is NOT touched.
 rebuild_project() {
   require_docker
   deploy_files
   local tag
-  tag=$(image_tag "$(pwd -P)")
+  tag=$(image_tag)
   info "Rebuilding image $tag from $BUILDER_DIR (no cache) ..."
   docker build \
     --no-cache \
@@ -583,6 +645,10 @@ main() {
     case "$1" in
       clear)   shift; clear_project; return 0 ;;
       rebuild) shift; rebuild_project; return 0 ;;
+      shell)   shift; require_docker; deploy_files; build_images
+               USERNAME="$(id -un)"
+               run_in_sandbox zsh
+               return 0 ;;
     esac
   fi
   require_docker
