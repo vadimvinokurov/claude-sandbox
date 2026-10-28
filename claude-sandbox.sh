@@ -62,6 +62,13 @@
 #      becomes a terminal selection (and the constant redraw erases it).
 #      Hold Option (or fn) while dragging to force a real selection; ⌘V is
 #      unaffected (paste needs no selection). Works with or without Docker.
+#   7. Project identity: the project is mounted INSIDE the container at
+#      the host path mirrored under /work/ (see container_root). Claude Code
+#      keys sessions, auto-memory and ~/.claude.json on the cwd — the old
+#      shared
+#      /work made every project look like one there. Old /work-keyed history
+#      does not migrate: `--resume` lists only the sessions of the project
+#      you launched from.
 #
 # .claudesandboxignore
 #   Use to hide parts of the project from the container.
@@ -120,8 +127,8 @@
 #   - ~/.gitconfig, ~/.ssh and ~/.config/gh are mounted READ-ONLY: the agent
 #     may authenticate with the host credentials but not damage or replace
 #     them. They are still readable — keys are exposed to the agent.
-#   - Anything Claude deletes in /work is deleted on the host — keep /work
-#     under version control.
+#   - Anything Claude deletes in the project mount (/work/<host path>, see
+#     item 7) is deleted on the host — keep the project under version control.
 #
 # Structure: constants → helpers → stages → main (at the end; add new stages
 # before main).
@@ -213,7 +220,8 @@ ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
 # COPY preserves the source mode, hence --chmod=555 (BuildKit).
 COPY --chmod=555 entrypoint.sh /entrypoint.sh
 
-# No CMD — the launcher always passes the command.
+# No CMD — the launcher always passes the command (and the per-project mount
+# point /work/<host path> via -w). The WORKDIR stays for manual docker runs.
 WORKDIR /work
 EOF_PLACEHOLDER
 
@@ -281,6 +289,19 @@ case "$(uname -s)" in
   *)
     hostpath() { printf '%s' "$1"; } ;;
 esac
+
+# container_root host_path — the project's mount point INSIDE the container:
+# the host path MIRRORED under /work/ ("/Users/me/app" → "/work/Users/me/app";
+# Git Bash's MSYS pwd form "/c/Users/..." carries no drive-letter colon, so
+# the container-side path never holds a character a container path can't).
+# Claude Code keys sessions, auto-memory and ~/.claude.json on the cwd: a
+# mount point identical for every project made all of them look like ONE
+# project there. The mirror keeps the identity unique per directory — same
+# project, same point, different projects never meet — and READABLE: pwd
+# inside shows where the project lives on the host.
+container_root() { # container_root host_path → stdout: /work/<mirror of path>
+  printf '/work/%s' "${1#/}"
+}
 
 # read_ignore_patterns file — reads a .claudesandboxignore file and prints its
 # patterns one per line: leading/trailing whitespace is trimmed, blank lines and
@@ -435,10 +456,11 @@ mem_limit() { # mem_limit → stdout: ${N}m
   clamp_mem "$(docker info --format '{{.MemTotal}}')"
 }
 
-# shadow_args project_dir — prints the hiding recipe for every entry matched
-# by .claudesandboxignore, one entry per line, TAB-separated:
-#   tmpfs<TAB>/work/<dir>   a dir is hidden with an empty tmpfs;
-#   bind<TAB><src>:<target> a file can't take a tmpfs — runc refuses a mount
+# shadow_args project_dir container_root — prints the hiding recipe for every
+# entry matched by .claudesandboxignore, one entry per line, TAB-separated:
+#   tmpfs<TAB><ctr>/<dir>   a dir is hidden with an empty tmpfs;
+#   bind<TAB><src>:<ctr>/<path>:ro
+#                           a file can't take a tmpfs — runc refuses a mount
 #                           over a non-directory ("not a directory", which
 #                           killed the container at start) — so it hides
 #                           behind an EMPTY placeholder file, created under
@@ -451,8 +473,9 @@ mem_limit() { # mem_limit → stdout: ${N}m
 #                           .claude-sandbox/.claude-sandbox/shadow/<path>).
 #                           Placeholders live in .claude-sandbox/ (never
 #                           scanned), wiped by "clear".
-shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
+shadow_args() { # shadow_args project_dir container_root → stdout: tmpfs/bind recipes
   local root="${1:-}"
+  local ctr="${2:?shadow_args: container_root required}"
   local shadows="$root/$SHADOWS_DIR"
   local p f
   # The placeholder tree is regenerated from scratch on EVERY run: leftovers
@@ -473,12 +496,12 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
     # mismatch dies at container start with "not a directory" — warning and
     # leaving the entry visible beats a session that doesn't launch.
     if [ -d "$root/$p" ] && [ ! -L "$root/$p" ]; then
-      printf 'tmpfs\t/work/%s\n' "$p"
+      printf 'tmpfs\t%s/%s\n' "$ctr" "$p"
     elif [ -f "$root/$p" ] && [ ! -L "$root/$p" ]; then
       f="$shadows/$p"
       mkdir -p "$(dirname "$f")"
       : > "$f"
-      printf 'bind\t%s:/work/%s:ro\n' "$(hostpath "$f")" "$p"
+      printf 'bind\t%s:%s/%s:ro\n' "$(hostpath "$f")" "$ctr" "$p"
     else
       printf 'WARN: .claudesandboxignore: entry "%s" is a symbolic link, junction or missing — not hidden, shown as is\n' "$p" >&2
     fi
@@ -492,21 +515,21 @@ shadow_args() { # shadow_args project_dir → stdout: tmpfs/bind recipes
     mkdir -p "$shadows"
     f="$shadows/.claudesandboxignore"
     : > "$f"
-    printf 'bind\t%s:/work/.claudesandboxignore:ro\n' "$(hostpath "$f")"
+    printf 'bind\t%s:%s/.claudesandboxignore:ro\n' "$(hostpath "$f")" "$ctr"
   fi
 }
 
 # shadow_mounts project_dir — shadow_args turned into docker argv words, one
 # per line (each line is exactly ONE word; the consumer reads with IFS= so
 # paths with spaces survive).
-shadow_mounts() { # shadow_mounts project_dir → stdout: docker argv words
+shadow_mounts() { # shadow_mounts project_dir container_root → stdout: docker argv words
   local kind val
   while IFS=$'\t' read -r kind val; do
     case "$kind" in
       tmpfs) printf '%s\n' "--tmpfs=$val" ;;
       bind)  printf '%s\n%s\n' -v "$val" ;;
     esac
-  done < <(shadow_args "$1")
+  done < <(shadow_args "$1" "$2")
 }
 
 # run_in_sandbox cmd... — docker run over the shared plumbing (isolation,
@@ -516,9 +539,13 @@ shadow_mounts() { # shadow_mounts project_dir → stdout: docker argv words
 # No exec: docker run -it replaces the terminal session itself; the exit code
 # arrives through the plain command.
 run_in_sandbox() { # run_in_sandbox [cmd...]
-  local project root
+  local project root work
   root=$(pwd -P)
   project=$(hostpath "$root")
+  # The per-project mount point: Claude Code keys sessions, memory and
+  # ~/.claude.json on the cwd, so the shared /work of old versions made every
+  # project look like one; see container_root.
+  work=$(container_root "$root")
   # Hiding mounts over every entry matched by .claudesandboxignore — empty
   # tmpfs for dirs, empty placeholder files for files (see shadow_mounts):
   # the host content stays untouched, inside the container the entry is
@@ -528,7 +555,7 @@ run_in_sandbox() { # run_in_sandbox [cmd...]
   local word
   while IFS= read -r word; do
     shadows+=("$word")
-  done < <(shadow_mounts "$root")
+  done < <(shadow_mounts "$root" "$work")
   # Host identity, read-only: the agent can push to remotes and run gh with
   # the host credentials, but cannot tamper with the keys or the config on
   # the host (a gh login still happens on the host). Each path is mounted
@@ -560,8 +587,9 @@ run_in_sandbox() { # run_in_sandbox [cmd...]
     --init --tmpfs /tmp --tmpfs /run \
     --network=host \
     -e TERM="${TERM:-xterm-256color}" \
+    -w "$work" \
     --entrypoint /entrypoint.sh \
-    -v "$project:/work" \
+    -v "$project:$work" \
     -v "$project/.claude-sandbox:/home/$USERNAME" \
     -v "$(hostpath "$HOME")/.claude:/home/$USERNAME/.claude" \
     -v "$(hostpath "$HOME")/.claude.json:/home/$USERNAME/.claude.json" \
